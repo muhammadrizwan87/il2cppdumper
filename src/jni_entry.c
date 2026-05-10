@@ -383,23 +383,27 @@ static int find_il2cpp_in_maps(char *out_path, size_t path_sz,
     return found;
 }
 
-/* -------------------------------------------------------------------------
+ /* -------------------------------------------------------------------------
  * Background dump thread
  * ------------------------------------------------------------------------- */
 /**
  * @brief Main dump thread routine.
  *
- * Steps:
- *   1. Wait for libil2cpp.so to appear in memory (up to 60 s).
- *   2. Identify the app package.
- *   3. Determine an output directory:
+ * Steps (all performed under crash‑handler protection):
+ *   1. Install SIGSEGV/SIGBUS handler and enter safe region.
+ *   2. Wait for libil2cpp.so to appear in memory (up to 60 s).
+ *   3. Identify the app package.
+ *   4. Determine an output directory:
  *        a. JNI‑acquired files dir (preferred, no permissions needed).
  *        b. /data/data/<pkg>/files/il2cpp_dump (fallback).
  *        c. /sdcard/il2cpp_dump (last resort).
- *   4. dlopen libil2cpp.so / RTLD_DEFAULT and resolve the IL2CPP API.
- *   5. Wait for domain, assemblies, and attach a thread.
- *   6. Install crash handler, enter sigsetjmp, and invoke the dump.
- *   7. Uninstall handler, detach IL2CPP thread, and exit.
+ *   5. dlopen libil2cpp.so / RTLD_DEFAULT and resolve the IL2CPP API.
+ *   6. Wait for domain, assemblies, and attach a thread.
+ *   7. Invoke the dump (il2cpp_do_dump).
+ *   8. Detach IL2CPP thread, uninstall crash handler, and exit.
+ *
+ * Any crash during steps 2‑7 causes a graceful abort
+ * (log message, cleanup, thread exits).
  *
  * @param arg Unused.
  * @return Always NULL.
@@ -410,6 +414,19 @@ static void *dump_thread(void *arg) {
     LOGI("dump_thread tid=%ld", (long)syscall(SYS_gettid));
 #endif
 
+    /* Install crash handler and enter safe region. */
+    install_crash_handler();
+    g_in_dump = 1;
+    int crash_sig = sigsetjmp(g_crash_jmp, 1);
+    if (crash_sig != 0) {
+        /* Crash occurred during dump; cleanly abort. */
+        LOGE("dump_thread caught signal %d during setup/discovery; "
+             "aborting safely.", crash_sig);
+        g_in_dump = 0;
+        uninstall_crash_handler();
+        return NULL;
+    }
+    
     char      il2cpp_path[PATH_MAX] = {0};
     uintptr_t il2cpp_base = 0;
     int       r;
@@ -536,30 +553,18 @@ static void *dump_thread(void *arg) {
     char output_file[PATH_MAX];
     snprintf(output_file, sizeof(output_file), "%s/dump.cs", output_dir);
 
-    /* Install crash handler and enter safe region. */
-    install_crash_handler();
-
-    g_in_dump = 1;
-    int crash_sig = sigsetjmp(g_crash_jmp, 1);
-
-    if (crash_sig == 0) {
-        /* Normal execution path. */
-        int ok = il2cpp_do_dump(output_file);
-        if (ok) { LOGI("SUCCESS: %s", output_file); }
-        else    { LOGE("FAILED:  %s", output_file); }
-    } else {
-        /* Crash occurred during dump; cleanly abort. */
-        LOGE("Dump caught signal %d; aborting to protect host app.", crash_sig);
-    }
-
-    g_in_dump = 0;
-    uninstall_crash_handler();
+    /* Normal execution path. */
+    int ok = il2cpp_do_dump(output_file);
+    if (ok) { LOGI("SUCCESS: %s", output_file); }
+    else    { LOGE("FAILED:  %s", output_file); }
 
     /* Detach from IL2CPP domain if we attached earlier. */
     if (il2cpp_thread && il2cpp_thread_detach) {
         il2cpp_thread_detach(il2cpp_thread);
     }
 
+    g_in_dump = 0;
+    uninstall_crash_handler();
     return NULL;
 }
 
