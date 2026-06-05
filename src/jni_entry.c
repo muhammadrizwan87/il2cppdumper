@@ -689,6 +689,7 @@ static void *dump_thread(void *arg) {
     /* Wait for IL2CPP domain to become available (runtime may still be
        initialising). */
     LOGI("Waiting for il2cpp domain...");
+    sleep(1);   // ← THIS. Give il2cpp_init() time to run.
     for (r = 0; r < 60; ++r) {
         if (il2cpp_domain_get && il2cpp_domain_get()) break;
         sleep(1);
