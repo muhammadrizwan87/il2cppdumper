@@ -18,7 +18,8 @@ app's own files directory.**
    1.2 [Container / Virtual Machine Native Support](#-container--vm-native-support)  
    1.3 [Crash-Safe Operation](#-crash-safe-operation)  
    1.4 [Zero Impact on App Behaviour](#-zero-impact-on-app-behaviour)  
-   1.5 [Multi-Strategy Enumeration](#-multi-strategy-enumeration)
+   1.5 [Multi-Strategy Enumeration](#-multi-strategy-enumeration)  
+   1.6 [Script Generation for Reverse Engineering Tools](#-script-generation-for-reverse-engineering-tools)
 2. [Limitations](#-2-limitations)
 3. [Security Perspective](#%EF%B8%8F-3-security-perspective)  
    3.1 [What This Library Can Access](#-what-this-library-can-access)  
@@ -70,6 +71,12 @@ The dumper automatically tries three enumeration methods, failing gracefully to 
 3. **Reflection‑based** – `Assembly.Load` + `GetTypes()` (slow but guaranteed to work even on stripped/obfuscated builds)
 
 This guarantees a successful dump on Unity versions from 2017.4 to the latest 6000.x releases.
+
+### ✅ Script Generation for Reverse Engineering Tools
+
+- **IDA, Ghidra, Binary Ninja, radare2 scripts** – Generated alongside `dump.cs`. Each script renames methods to C# names, adds full metadata comments (dll, namespace, class, return type, parameters), and **renames parameters**. Ghidra additionally maps primitive types and replaces prototypes.
+- **Zero manual mapping** – No need to cross‑reference RVAs or write custom importers. Just load your binary and run the script.
+- **Usage** – Each script’s header explains its usage. Follow the workflow from there.
 
 ---
 
