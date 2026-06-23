@@ -743,7 +743,7 @@ static void *dump_thread(void *arg) {
     snprintf(output_file, sizeof(output_file), "%s/dump.cs", output_dir);
 
     /* Normal execution path. */
-    int ok = il2cpp_do_dump(output_file);
+    int ok = il2cpp_do_dump(output_file, output_dir);
     if (ok) { LOGI("SUCCESS: %s", output_file); }
     else    { LOGE("FAILED:  %s", output_file); }
 

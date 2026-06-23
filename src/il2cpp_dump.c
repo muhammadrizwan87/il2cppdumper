@@ -1,6 +1,7 @@
 /**
- * @file il2cpp_dump_new.c
- * @brief IL2CPP type enumeration and C#‑like dump routines (file descriptor version).
+ * @file il2cpp_dump.c
+ * @brief IL2CPP type enumeration and C#‑like dump routines (file descriptor version),
+ *        with optional ScriptWriter integration.
  *
  * This module contains the core logic for walking IL2CPP metadata and
  * writing a human‑readable, C#‑like representation of all managed types
@@ -30,12 +31,19 @@
  *       `flockfile()` mutexes. A crash‑handling `siglongjmp()` while
  *       that mutex is held leads to deadlock and `SIGABRT` on bionic.
  *       `write()` is async‑signal‑safe and avoids this issue.
+ *
+ * @par Optional structured output
+ * In addition to the human‑readable `dump.cs`, this module can also emit
+ * a structured representation (e.g., JSON) via a `ScriptWriter` instance.
+ * The writer receives per‑method details (RVA, flags, parameters, etc.)
+ * during the dump, allowing further automated processing.
  */
 
 #include "il2cpp_dump.h"
 #include "il2cpp_api.h"
 #include "il2cpp_tabledefs.h"
 #include "log.h"
+#include "script_writer.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -45,7 +53,6 @@
 #include <errno.h>
 #include <stdio.h>
 #include <sys/stat.h>
-
 
 #define SBUF 4096
 
@@ -257,14 +264,13 @@ static void write_method_modifier(int fd, uint32_t flags) {
   } else if (flags & METHOD_ATTRIBUTE_VIRTUAL) {
     if ((flags & METHOD_ATTRIBUTE_VTABLE_LAYOUT_MASK) == METHOD_ATTRIBUTE_NEW_SLOT)
       safe_puts(fd, "virtual ");
-    else
-      safe_puts(fd, "override ");
+    else safe_puts(fd, "override ");
   }
   if (flags & METHOD_ATTRIBUTE_PINVOKE_IMPL) safe_puts(fd, "extern ");
 }
 
 /* -------------------------------------------------------------------------
- * Field dumper (fd version)
+ * Field dumper (fd version) with ScriptWriter integration
  * ------------------------------------------------------------------------- */
 
 /**
@@ -273,10 +279,23 @@ static void write_method_modifier(int fd, uint32_t flags) {
  * Also prints the field type, name, memory offset, and for literal enum
  * fields, the constant value.
  *
- * @param fd    Output file descriptor.
- * @param klass The enclosing class (used to detect enums).
+ * @param fd         Output file descriptor.
+ * @param sw         ScriptWriter handle for structured output (may be NULL).
+ * @param dll        Assembly name (for structured output).
+ * @param ns         Namespace (for structured output).
+ * @param classname  Class name (for structured output).
+ * @param klass      Enclosing class (used to detect enums).
  */
-static void dump_fields(int fd, Il2CppClass * klass) {
+static void dump_fields(int fd, ScriptWriter * sw,
+  const char * dll,
+    const char * ns,
+      const char * classname,
+        Il2CppClass * klass) {
+  (void) sw;
+  (void) dll;
+  (void) ns;
+  (void) classname;
+
   bool is_enum = il2cpp_class_is_enum ? il2cpp_class_is_enum(klass) : false;
   void * iter = NULL;
   FieldInfo * field;
@@ -338,11 +357,12 @@ static void dump_fields(int fd, Il2CppClass * klass) {
     b_szx(buf, & pos, offset);
     B_CHR(buf, pos, '\n');
     B_FLUSH(fd, buf, pos);
+
   }
 }
 
 /* -------------------------------------------------------------------------
- * Property dumper (fd version)
+ * Property dumper (fd version) with ScriptWriter integration
  * ------------------------------------------------------------------------- */
 
 /**
@@ -353,9 +373,11 @@ static void dump_fields(int fd, Il2CppClass * klass) {
  * accessor placeholders.
  *
  * @param fd    Output file descriptor.
+ * @param sw    ScriptWriter handle for structured output (may be NULL).
  * @param klass Enclosing class.
  */
-static void dump_properties(int fd, Il2CppClass * klass) {
+static void dump_properties(int fd, ScriptWriter * sw, Il2CppClass * klass) {
+  (void) sw;
   void * iter = NULL;
   const PropertyInfo * prop;
 
@@ -368,8 +390,7 @@ static void dump_properties(int fd, Il2CppClass * klass) {
     const char * pname = il2cpp_property_get_name(p);
 
     Il2CppClass * prop_class = NULL;
-    uint32_t iflags = 0;
-    uint32_t flags = 0;
+    uint32_t iflags = 0, flags = 0;
 
     if (get) {
       flags = il2cpp_method_get_flags(get, & iflags);
@@ -412,27 +433,41 @@ static void dump_properties(int fd, Il2CppClass * klass) {
 }
 
 /* -------------------------------------------------------------------------
- * Method dumper (fd version)
+ * Method dumper (fd version) with ScriptWriter integration
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Write method declarations.
+ * @brief Write method declarations and optionally feed structured data to ScriptWriter.
  *
  * Includes the RVA (relative virtual address) and VA (absolute) as
  * a comment, then prints the method signature: modifiers, return type,
  * name, and parameter list (`ref`, `out`, `in`, `[In]`, `[Out]`).
  *
- * @param fd    Output file descriptor.
- * @param klass Enclosing class.
- * @param base  Base address of libil2cpp.so (for RVA calculation).
+ * If @p sw is non‑NULL, the method metadata (name, return type,
+ * parameter list, flags, RVA, VA) is also passed to the writer for
+ * structured output.
+ *
+ * @param fd         Output file descriptor.
+ * @param sw         ScriptWriter handle (may be NULL).
+ * @param dll        Assembly name.
+ * @param ns         Namespace.
+ * @param classname  Class name.
+ * @param klass      Enclosing class.
+ * @param base       Base address of libil2cpp.so (for RVA calculation).
  */
-static void dump_methods(int fd, Il2CppClass * klass, uintptr_t base) {
+static void dump_methods(int fd, ScriptWriter * sw,
+  const char * dll,
+    const char * ns,
+      const char * classname,
+        Il2CppClass * klass, uintptr_t base) {
   void * iter = NULL;
   const MethodInfo * method;
 
   safe_puts(fd, "\n\t// Methods\n");
 
   while ((method = il2cpp_class_get_methods(klass, & iter)) != NULL) {
+    uintptr_t sw_va = 0, sw_rva = 0;
+
     // Address comment
     {
       char buf[128];
@@ -444,6 +479,8 @@ static void dump_methods(int fd, Il2CppClass * klass, uintptr_t base) {
         b_hex(buf, & pos, (unsigned long) rva);
         B_STR(buf, pos, " VA: ");
         b_hex(buf, & pos, (unsigned long) va);
+        sw_va = va;
+        sw_rva = rva;
       } else {
         B_STR(buf, pos, "\t// RVA: 0x0 VA: 0x0");
       }
@@ -460,6 +497,12 @@ static void dump_methods(int fd, Il2CppClass * klass, uintptr_t base) {
     const Il2CppType * rtype = il2cpp_method_get_return_type(method);
     Il2CppClass * rclass = rtype ? il2cpp_class_from_type(rtype) : NULL;
 
+    char sw_pbuf[512] = {
+      0
+    };
+    size_t sw_ppos = 0;
+    const char * sw_mname = NULL;
+
     {
       char buf[SBUF];
       size_t pos = 0;
@@ -467,6 +510,7 @@ static void dump_methods(int fd, Il2CppClass * klass, uintptr_t base) {
       B_STR(buf, pos, safe_class_name(rclass));
       B_CHR(buf, pos, ' ');
       const char * mname = il2cpp_method_get_name(method);
+      sw_mname = mname;
       B_STR(buf, pos, mname ? mname : "<unnamed>");
       B_CHR(buf, pos, '(');
       B_FLUSH(fd, buf, pos);
@@ -500,14 +544,45 @@ static void dump_methods(int fd, Il2CppClass * klass, uintptr_t base) {
         B_STR(pbuf, ppos, pname ? pname : "param");
         if (i + 1 < param_count) B_STR(pbuf, ppos, ", ");
         B_FLUSH(fd, pbuf, ppos);
+
+        // Build parameter string for ScriptWriter
+        if (sw && sw_ppos + 64 < sizeof(sw_pbuf)) {
+          if (i > 0 && sw_ppos + 2 < sizeof(sw_pbuf)) {
+            sw_pbuf[sw_ppos++] = ',';
+            sw_pbuf[sw_ppos++] = ' ';
+          }
+          const char * tn = safe_class_name(pclass);
+          size_t tl = strlen(tn);
+          if (sw_ppos + tl + 1 < sizeof(sw_pbuf)) {
+            memcpy(sw_pbuf + sw_ppos, tn, tl);
+            sw_ppos += tl;
+            sw_pbuf[sw_ppos++] = ' ';
+          }
+          if (pname) {
+            size_t nl = strlen(pname);
+            if (sw_ppos + nl < sizeof(sw_pbuf)) {
+              memcpy(sw_pbuf + sw_ppos, pname, nl);
+              sw_ppos += nl;
+            }
+          }
+        }
       }
+      sw_pbuf[sw_ppos] = '\0';
     }
     safe_puts(fd, ") { }\n");
+
+    // Feed method data to ScriptWriter if available
+    if (sw) {
+      sw_write_method(sw, dll, ns, classname,
+        sw_mname ? sw_mname : "<unnamed>",
+        safe_class_name(rclass),
+        sw_pbuf, flags, sw_rva, sw_va);
+    }
   }
 }
 
 /* -------------------------------------------------------------------------
- * Single class dump (fd version)
+ * Single class dump (fd version) with ScriptWriter integration
  * ------------------------------------------------------------------------- */
 
 /**
@@ -520,11 +595,18 @@ static void dump_methods(int fd, Il2CppClass * klass, uintptr_t base) {
  *   - Base type and implemented interfaces.
  *   - Fields, properties, and methods.
  *
+ * Additionally, if @p sw is non‑NULL, class metadata (dll, namespace,
+ * class name) is passed down to the structured writer.
+ *
  * @param fd    Output file descriptor.
+ * @param sw    ScriptWriter handle (may be NULL).
+ * @param dll   Assembly name.
  * @param klass IL2CPP class to dump.
  * @param base  libil2cpp.so base address for RVA calculation.
  */
-static void dump_single_class(int fd, Il2CppClass * klass, uintptr_t base) {
+static void dump_single_class(int fd, ScriptWriter * sw,
+  const char * dll,
+    Il2CppClass * klass, uintptr_t base) {
   if (!klass || !il2cpp_class_get_type) return;
   const Il2CppType * type = il2cpp_class_get_type(klass);
   if (!type) return;
@@ -597,9 +679,9 @@ static void dump_single_class(int fd, Il2CppClass * klass, uintptr_t base) {
       }
     }
     if (il2cpp_class_get_interfaces) {
-      void * iter = NULL;
+      void * it = NULL;
       Il2CppClass * itf;
-      while ((itf = il2cpp_class_get_interfaces(klass, & iter)) != NULL) {
+      while ((itf = il2cpp_class_get_interfaces(klass, & it)) != NULL) {
         B_STR(buf, pos, sep);
         B_STR(buf, pos, safe_class_name(itf));
         memcpy(sep, ", ", 3);
@@ -609,14 +691,14 @@ static void dump_single_class(int fd, Il2CppClass * klass, uintptr_t base) {
   B_STR(buf, pos, "\n{\n");
   B_FLUSH(fd, buf, pos);
 
-  dump_fields(fd, klass);
-  dump_properties(fd, klass);
-  dump_methods(fd, klass, base);
+  dump_fields(fd, sw, dll, ns ? ns : "", safe_class_name(klass), klass);
+  dump_properties(fd, sw, klass);
+  dump_methods(fd, sw, dll, ns ? ns : "", safe_class_name(klass), klass, base);
   safe_puts(fd, "}\n");
 }
 
 /* -------------------------------------------------------------------------
- * Strategy 1: Dump via image_get_class (fd version)
+ * Strategy 1: Dump via image_get_class (fd version) with ScriptWriter
  * ------------------------------------------------------------------------- */
 
 /**
@@ -626,24 +708,22 @@ static void dump_single_class(int fd, Il2CppClass * klass, uintptr_t base) {
  * Each class is annotated with the DLL (image) name.
  *
  * @param fd   Output file descriptor.
+ * @param sw   ScriptWriter handle (may be NULL).
  * @param base libil2cpp.so base address.
  * @return 1 on success, 0 if the required APIs are missing.
  */
-static int dump_by_image(int fd, uintptr_t base) {
+static int dump_by_image(int fd, ScriptWriter * sw, uintptr_t base) {
   if (!il2cpp_image_get_class || !il2cpp_image_get_class_count) {
     LOGI("il2cpp_image_get_class not available; trying fallback");
     return 0;
   }
-
   Il2CppDomain * domain = il2cpp_domain_get();
   size_t asm_count = 0;
   const Il2CppAssembly ** assemblies = il2cpp_domain_get_assemblies(domain, & asm_count);
-
   if (!assemblies || asm_count == 0) {
     LOGE("No assemblies found in domain");
     return 0;
   }
-
   LOGI("Dumping %zu assemblies (strategy: image_get_class)", asm_count);
 
   // First pass: list assemblies for readability
@@ -676,14 +756,14 @@ static int dump_by_image(int fd, uintptr_t base) {
       B_STR(buf, pos, "\n// Dll: ");
       B_STR(buf, pos, img_name ? img_name : "?");
       B_FLUSH(fd, buf, pos);
-      dump_single_class(fd, (Il2CppClass * ) klass, base);
+      dump_single_class(fd, sw, img_name ? img_name : "?", (Il2CppClass * ) klass, base);
     }
   }
   return 1;
 }
 
 /* -------------------------------------------------------------------------
- * Strategy 2: Dump via il2cpp_class_for_each (fd version)
+ * Strategy 2: Dump via il2cpp_class_for_each (fd version) with ScriptWriter
  * ------------------------------------------------------------------------- */
 
 /**
@@ -691,6 +771,7 @@ static int dump_by_image(int fd, uintptr_t base) {
  */
 typedef struct {
   int fd; /**< Output file descriptor. */
+  ScriptWriter * sw; /**< ScriptWriter handle (may be NULL). */
   uintptr_t base; /**< libil2cpp.so base address. */
   size_t count; /**< Number of classes written (accumulated). */
 }
@@ -720,7 +801,7 @@ static void for_each_callback(Il2CppClass * klass, void * user_data) {
   B_STR(buf, pos, "\n// Dll: ");
   B_STR(buf, pos, dll);
   B_FLUSH(ctx -> fd, buf, pos);
-  dump_single_class(ctx -> fd, klass, ctx -> base);
+  dump_single_class(ctx -> fd, ctx -> sw, dll, klass, ctx -> base);
   ctx -> count++;
 }
 
@@ -730,14 +811,16 @@ static void for_each_callback(Il2CppClass * klass, void * user_data) {
  * Requires the `il2cpp_class_for_each` function pointer.
  *
  * @param fd   Output file descriptor.
+ * @param sw   ScriptWriter handle (may be NULL).
  * @param base libil2cpp.so base address.
  * @return 1 if at least one class was written, 0 otherwise.
  */
-static int dump_by_for_each(int fd, uintptr_t base) {
+static int dump_by_for_each(int fd, ScriptWriter * sw, uintptr_t base) {
   if (!il2cpp_class_for_each) return 0;
   LOGI("Dumping via il2cpp_class_for_each (strategy: for_each)");
   ForEachCtx ctx;
   ctx.fd = fd;
+  ctx.sw = sw;
   ctx.base = base;
   ctx.count = 0;
   il2cpp_class_for_each(for_each_callback, & ctx);
@@ -746,7 +829,7 @@ static int dump_by_for_each(int fd, uintptr_t base) {
 }
 
 /* -------------------------------------------------------------------------
- * Strategy 3: Reflection‑based dump (slow fallback, fd version)
+ * Strategy 3: Reflection‑based dump (slow fallback, fd version) with ScriptWriter
  * ------------------------------------------------------------------------- */
 
 /** Prototype for Assembly.Load(string) */
@@ -763,17 +846,17 @@ typedef Il2CppArray * ( * AssemblyGetTypes_ftn)(void * , void * );
  * `System.Type` by converting it back to an `Il2CppClass`.
  *
  * @param fd   Output file descriptor.
+ * @param sw   ScriptWriter handle (may be NULL).
  * @param base libil2cpp.so base address.
  * @return 1 on success, 0 if necessary APIs are missing.
  */
-static int dump_by_reflection(int fd, uintptr_t base) {
+static int dump_by_reflection(int fd, ScriptWriter * sw, uintptr_t base) {
   if (!il2cpp_get_corlib || !il2cpp_class_from_name ||
     !il2cpp_class_get_method_from_name || !il2cpp_string_new ||
     !il2cpp_class_from_system_type) {
     LOGW("Reflection APIs unavailable; cannot fall back to GetTypes()");
     return 0;
   }
-
   const Il2CppImage * corlib = il2cpp_get_corlib();
   Il2CppClass * asm_class = il2cpp_class_from_name(corlib, "System.Reflection", "Assembly");
   if (!asm_class) {
@@ -783,7 +866,6 @@ static int dump_by_reflection(int fd, uintptr_t base) {
 
   const MethodInfo * load_method = il2cpp_class_get_method_from_name(asm_class, "Load", 1);
   const MethodInfo * types_method = il2cpp_class_get_method_from_name(asm_class, "GetTypes", 0);
-
   if (!load_method || !load_method -> methodPointer) {
     LOGE("Assembly.Load not found");
     return 0;
@@ -803,7 +885,6 @@ static int dump_by_reflection(int fd, uintptr_t base) {
     LOGE("No assemblies for reflection dump");
     return 0;
   }
-
   LOGI("Reflection dump: %zu assemblies", asm_count);
 
   size_t i;
@@ -812,14 +893,12 @@ static int dump_by_reflection(int fd, uintptr_t base) {
     if (!img) continue;
     const char * img_name = il2cpp_image_get_name(img);
     if (!img_name) img_name = "?";
-
     // Strip .dll extension to get the assembly name for Load()
     char asm_name[256];
     strncpy(asm_name, img_name, sizeof(asm_name) - 1);
     asm_name[sizeof(asm_name) - 1] = '\0';
     char * dot = strrchr(asm_name, '.');
     if (dot) * dot = '\0';
-
     Il2CppString * asm_str = il2cpp_string_new(asm_name);
     void * refl_asm = fn_load(NULL, asm_str, NULL);
     if (!refl_asm) {
@@ -828,7 +907,6 @@ static int dump_by_reflection(int fd, uintptr_t base) {
     }
     Il2CppArray * types = fn_types(refl_asm, NULL);
     if (!types) continue;
-
     il2cpp_array_size_t j;
     for (j = 0; j < types -> max_length; ++j) {
       Il2CppReflectionType * rt = (Il2CppReflectionType * ) types -> vector[j];
@@ -839,65 +917,45 @@ static int dump_by_reflection(int fd, uintptr_t base) {
       B_STR(buf, pos, "\n// Dll: ");
       B_STR(buf, pos, img_name);
       B_FLUSH(fd, buf, pos);
-      dump_single_class(fd, klass, base);
+      dump_single_class(fd, sw, img_name, klass, base);
     }
   }
   return 1;
 }
 
 /* -------------------------------------------------------------------------
- * Public API: initialisation helper & main dump entry
+ * Public API: main dump entry
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Block until the IL2CPP domain is available.
- *
- * Polls `il2cpp_domain_get` every second for up to 60 seconds.
- * If the function pointer itself is NULL, we cannot perform the check
- * and simply wait for 3 seconds before returning success.
- *
- * @return 1 if the domain is ready, 0 on timeout.
- */
-int il2cpp_wait_for_init(void) {
-  LOGI("Waiting for il2cpp domain to become ready...");
-  if (!il2cpp_domain_get) {
-    LOGW("il2cpp_domain_get unavailable; skipping init check");
-    sleep(3);
-    return 1;
-  }
-  int timeout = 60;
-  while (timeout--> 0) {
-    Il2CppDomain * d = il2cpp_domain_get();
-    if (d) {
-      LOGI("il2cpp domain ready (%p)", (void * ) d);
-      return 1;
-    }
-    sleep(1);
-  }
-  LOGE("Timed out waiting for il2cpp domain");
-  return 0;
-}
-
-/**
- * @brief Perform the IL2CPP metadata dump (file descriptor version).
+ * @brief Perform the IL2CPP metadata dump (file descriptor version) with
+ *        optional structured output.
  *
  * Opens the output file (retrying up to 10 times if the directory
  * does not exist, and falling back to alternative paths on failure),
  * determines the base address of libil2cpp.so, and tries the three
  * dumping strategies in order.
  *
- * @param output_path Desired path for the dump file (e.g. /.../dump.cs).
- * @return 1 on success, 0 on failure.
+ * If @p output_dir is non‑NULL and non‑empty, a `ScriptWriter` is opened
+ * at that directory to produce additional structured data (e.g., JSON)
+ * alongside the human‑readable `dump.cs`.  The structured output may be
+ * used for further analysis or tooling.
+ *
+ * @param output_path  Desired path for the human‑readable `dump.cs` file.
+ * @param output_dir   Optional directory for structured output (e.g., JSON).
+ *                     If NULL or empty, no structured output is generated.
+ * @return 1 on success, 0 on failure (missing APIs, no assemblies, I/O
+ *         error, or all dump strategies failed).
  */
-int il2cpp_do_dump(const char * output_path) {
+int il2cpp_do_dump(const char * output_path,
+  const char * output_dir) {
   if (!output_path) {
     LOGE("output_path is NULL");
     return 0;
   }
 
   // Retry-based file opening with directory creation (fd version)
-  int out_fd = -1;
-  int attempt;
+  int out_fd = -1, attempt;
   for (attempt = 1; attempt <= 10; ++attempt) {
     char dir[512];
     strncpy(dir, output_path, sizeof(dir) - 1);
@@ -912,8 +970,7 @@ int il2cpp_do_dump(const char * output_path) {
       LOGI("Output file opened on attempt %d: %s", attempt, output_path);
       break;
     }
-    LOGW("open attempt %d/10 failed: %s errno=%d (%s)",
-      attempt, output_path, errno, strerror(errno));
+    LOGW("open attempt %d/10 failed: %s errno=%d (%s)", attempt, output_path, errno, strerror(errno));
     if (attempt < 10) sleep(1);
   }
 
@@ -959,13 +1016,20 @@ int il2cpp_do_dump(const char * output_path) {
     return 0;
   }
 
+  // Open ScriptWriter for structured output if directory provided
+  ScriptWriter * sw = NULL;
+  if (output_dir && output_dir[0]) {
+    sw = sw_open(output_dir);
+    if (!sw) LOGW("sw_open failed; dump.cs will still be written");
+  }
+
   uintptr_t base = il2cpp_get_base();
   LOGI("il2cpp base: 0x%lx", (unsigned long) base);
 
   int ok = 0;
-  if (!ok) ok = dump_by_image(out_fd, base);
-  if (!ok) ok = dump_by_for_each(out_fd, base);
-  if (!ok) ok = dump_by_reflection(out_fd, base);
+  if (!ok) ok = dump_by_image(out_fd, sw, base);
+  if (!ok) ok = dump_by_for_each(out_fd, sw, base);
+  if (!ok) ok = dump_by_reflection(out_fd, sw, base);
 
   if (!ok) {
     // Record which APIs were missing for post‑mortem debugging
@@ -981,6 +1045,7 @@ int il2cpp_do_dump(const char * output_path) {
   }
 
   close(out_fd);
+  if (sw) sw_close(sw);
   if (ok) LOGI("Dump complete -> %s", output_path);
   return ok;
 }

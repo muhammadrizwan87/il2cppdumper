@@ -13,7 +13,8 @@ LOCAL_SRC_FILES := \
 	../src/jni_entry.c \
 	../src/il2cpp_dump.c \
 	../src/il2cpp_api.c \
-	../src/elf_sym_find.c
+	../src/elf_sym_find.c \
+	../src/script_writer.c
 
 # Compiler flags
 
