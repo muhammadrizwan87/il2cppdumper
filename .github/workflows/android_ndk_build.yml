@@ -28,5 +28,5 @@ jobs:
         
     - uses: actions/upload-artifact@v6
       with:
-        name: Il2CppDumper-v1.1.0
+        name: Il2CppDumper-v2.0.0
         path: artifacts/
